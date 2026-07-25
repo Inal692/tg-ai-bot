@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-🤖 Telegram-бот для PythonAnywhere (вебхуки + Flask)
+🤖 Telegram-бот для PythonAnywhere (вебхуки + Flask).
+Gemini вызывается через REST API (библиотека google-genai не нужна).
 """
+import json
 import logging
 import os
 from collections import defaultdict
 
 import requests
 from flask import Flask, request
-from google import genai
-from google.genai import types as genai_types
 
 # ── конфиг из переменных окружения ──────────────────────────────────────────
 BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
@@ -23,51 +23,54 @@ SYSTEM_PROMPT = os.environ.get(
 )
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
+)
 
 # ── логирование ──────────────────────────────────────────────────────────────
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ── Gemini ───────────────────────────────────────────────────────────────────
-client = genai.Client(api_key=GEMINI_KEY)
-
 # ── история диалогов ────────────────────────────────────────────────────────
 chat_history: dict[int, list[dict]] = defaultdict(list)
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
-
-def _build_contents(user_id: int, message: str) -> list[genai_types.Content]:
-    contents = []
-    for msg in chat_history[user_id][-MAX_HISTORY:]:
-        contents.append(genai_types.Content(
-            role=msg["role"],
-            parts=[genai_types.Part(text=msg["text"])],
-        ))
-    contents.append(genai_types.Content(
-        role="user",
-        parts=[genai_types.Part(text=message)],
-    ))
-    return contents
-
+# ── Gemini через REST ────────────────────────────────────────────────────────
 
 def ask_gemini(user_id: int, user_message: str) -> str:
+    """Отправляет запрос в Gemini через REST API и возвращает ответ."""
     try:
-        contents = _build_contents(user_id, user_message)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.7,
-                max_output_tokens=4096,
-            ),
-        )
-        return response.text.strip()
+        # собираем содержимое: системный промпт + история + текущее сообщение
+        contents = []
+        for msg in chat_history[user_id][-MAX_HISTORY:]:
+            contents.append({"role": msg["role"], "parts": [{"text": msg["text"]}]})
+        contents.append({"role": "user", "parts": [{"text": user_message}]})
+
+        payload = {
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 4096,
+            },
+        }
+
+        log.info("Gemini запрос от user=%d: %.80s", user_id, user_message)
+        resp = requests.post(GEMINI_URL, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        answer = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        log.info("Gemini ответ user=%d: %d символов", user_id, len(answer))
+        return answer
+
     except Exception as exc:
-        log.exception("Gemini error")
+        log.exception("Gemini ошибка user=%d", user_id)
         return f"😔 Ошибка: {exc!s}"
 
+
+# ── отправка сообщений в Telegram ───────────────────────────────────────────
 
 def tg_send(chat_id: int, text: str) -> None:
     if len(text) > 4000:
@@ -79,19 +82,16 @@ def tg_send(chat_id: int, text: str) -> None:
             "parse_mode": "Markdown",
         }, timeout=15)
     except Exception as exc:
-        log.error("Failed to send: %s", exc)
+        log.error("Ошибка отправки: %s", exc)
 
 
 # ── обработка сообщений ─────────────────────────────────────────────────────
 
 def handle_message(chat_id: int, user_id: int, text: str) -> str:
-    # команды
     if text == "/start":
         return (
-            f"👋 Привет!\n\n"
-            f"Я — бот с бесплатной ИИ на базе **Google Gemini** ({GEMINI_MODEL}).\n"
-            f"Просто напиши мне что-нибудь.\n\n"
-            f"Команды:\n"
+            f"👋 Привет! Я бот с бесплатной ИИ на базе **Google Gemini** ({GEMINI_MODEL}).\n\n"
+            f"Просто напиши мне что-нибудь.\n"
             f"• /clear — очистить историю\n"
             f"• /stats — статистика"
         )
@@ -119,18 +119,19 @@ app = Flask(__name__)
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(force=True)
-    log.info("Webhook: %s", data.get("message", {}).get("text", "(not a message)"))
+    msg = data.get("message", {})
+
+    log.info("Webhook от user=%d: %.80s", msg.get("from", {}).get("id"), msg.get("text", ""))
 
     if "message" not in data:
         return "OK", 200
 
-    msg = data["message"]
-    chat_id = msg["chat"]["id"]
-    user_id = msg["from"]["id"]
     text = msg.get("text", "").strip()
-
     if not text:
         return "OK", 200
+
+    chat_id = msg["chat"]["id"]
+    user_id = msg["from"]["id"]
 
     answer = handle_message(chat_id, user_id, text)
     tg_send(chat_id, answer)
@@ -145,4 +146,4 @@ def index():
 # для локального теста
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port)

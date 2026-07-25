@@ -1,3 +1,8 @@
-python-telegram-bot==22.8
-google-genai==2.14.0
-python-dotenv==1.2.2
+# для PythonAnywhere (pa_bot.py) — всё, что нужно
+flask==3.1.*
+requests==2.34.*
+
+# для локального запуска (bot.py) — не обязательно на PythonAnywhere
+# google-genai==2.14.0
+# python-telegram-bot==22.8
+# python-dotenv==1.2.2
