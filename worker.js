@@ -1,15 +1,17 @@
 // Cloudflare Worker: Telegram Bot with Gemini AI
-// Режимы: текст / картинки, подробные ответы, "печатает..."
+// Текст через Gemini, картинки через Pollinations.ai (бесплатно)
 
 const SYSTEM_PROMPT = `Ты — полезный ИИ-помощник в Telegram.
-Отвечай подробно, развёрнуто.
-Если тебя просят создать видео — сразу отвечай, что не умеешь создавать видео.
-Отвечай на том же языке, на котором к тебе обратились.
-После каждого ответа добавляй короткую подсказку: "/mode — сменить режим".`;
+Отвечай подробно, развёрнуто, без воды.
+Если просят создать видео — отвечай, что не умеешь.
+Отвечай на том же языке, что и вопрос.
+После ответа добавляй строчку: "/mode — сменить режим".`;
 
 const TEXT_MODEL = "gemini-3.5-flash";
-const IMAGE_MODEL = "imagen-4.0-fast-generate-001";
 const MAX_HISTORY = 15;
+
+const userMode = new Map();
+const chatHistory = new Map();
 
 export default {
   async fetch(request, env, ctx) {
@@ -19,18 +21,12 @@ export default {
     }
     if (url.pathname === "/webhook" && request.method === "POST") {
       const update = await request.json();
-      if (update.message) {
-        ctx.waitUntil(processMessage(update.message, env));
-      }
+      if (update.message) ctx.waitUntil(processMessage(update.message, env));
       return new Response("OK", { status: 200 });
     }
     return new Response("Not found", { status: 404 });
   },
 };
-
-// ── хранилище (in-memory, без KV) ───────────────────────────────────────────
-const userMode = new Map();    // userId -> "text" | "image"
-const chatHistory = new Map(); // userId -> [{role,text}]
 
 async function processMessage(msg, env) {
   const chatId = msg.chat.id;
@@ -39,23 +35,15 @@ async function processMessage(msg, env) {
   if (!text) return;
 
   // показываем "печатает..."
-  fetch("https://api.telegram.org/bot" + env.TG_BOT_TOKEN + "/sendChatAction", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, action: "typing" }),
-  }).catch(() => {});
+  sendAction(env, chatId);
 
   // ── команды ───────────────────────────────────────────────────────────────
   if (text === "/start") {
     return sendMsg(env, chatId,
-      "👋 *Привет!* Я бот с ИИ от Google Gemini.\n\n"
-      + "• ✍️ *Текст* — отвечаю на вопросы\n"
-      + "• 🎨 *Картинки* — создаю изображения\n\n"
-      + "Команды:\n"
-      + "• `/mode` — посмотреть/сменить режим\n"
-      + "• `/mode text` — текстовый режим\n"
-      + "• `/mode image` — режим картинок\n"
-      + "• `/clear` — очистить историю"
+      "👋 *Привет!* Я бот с ИИ на Google Gemini.\n\n"
+      + "• ✍️ */mode text* — отвечаю на вопросы\n"
+      + "• 🎨 */mode image* — создаю картинки\n"
+      + "• 🧹 */clear* — очистить историю"
     );
   }
 
@@ -67,14 +55,15 @@ async function processMessage(msg, env) {
         userMode.set(userId, m);
         return sendMsg(env, chatId,
           m === "text"
-            ? "✅ *Текстовый* режим. Просто задавай вопросы!"
-            : "✅ *Режим картинок*. Опиши, что нарисовать!"
+            ? "✅ *Текст* — задавай вопросы!"
+            : "✅ *Картинки* — опиши что нарисовать!"
         );
       }
     }
+    const cur = userMode.get(userId) || "text";
     return sendMsg(env, chatId,
-      "🎛 *Текущий режим:* " + (userMode.get(userId) === "image" ? "🎨 Картинки" : "✍️ Текст")
-      + "\n\n• `/mode text` — текст\n• `/mode image` — картинки"
+      "🎛 Режим: " + (cur === "image" ? "🎨 Картинки" : "✍️ Текст")
+      + "\n· `/mode text`\n· `/mode image`"
     );
   }
 
@@ -84,46 +73,56 @@ async function processMessage(msg, env) {
   }
 
   // ── проверка на видео ────────────────────────────────────────────────────
-  const lower = text.toLowerCase();
-  if (["видео", "video", "ролик", "клип", "сделай видео"].some(w => lower.includes(w))) {
-    return sendMsg(env, chatId,
-      "😅 Я не умею создавать видео.\n"
-      + "Могу только текст ✍️ или картинки 🎨\n/compose /mode чтобы переключиться."
-    );
+  const low = text.toLowerCase();
+  if (["видео", "video", "ролик", "клип", "сделай видео"].some(w => low.includes(w))) {
+    return sendMsg(env, chatId, "😅 Я не умею создавать видео. Только текст ✍️ или картинки 🎨");
   }
 
-  // ── выбор режима ──────────────────────────────────────────────────────────
-  const mode = userMode.get(userId) || "text";
+  // ── режим ИЗОБРАЖЕНИЕ ────────────────────────────────────────────────────
+  if ((userMode.get(userId) || "text") === "image") {
+    await fetch("https://api.telegram.org/bot" + env.TG_BOT_TOKEN + "/sendChatAction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, action: "upload_photo" }),
+    }).catch(() => {});
 
-  if (mode === "image") {
-    const result = await generateImage(text, env);
-    if (result.image) {
-      await sendImage(env, chatId, result.image, result.caption);
+    const result = await generateImage(text);
+    if (result.error) {
+      await sendMsg(env, chatId, result.error);
     } else {
-      await sendMsg(env, chatId, result.text);
+      await sendImage(env, chatId, result.url, result.caption);
     }
-  } else {
-    const answer = await askGemini(userId, text, env);
-    await sendMsg(env, chatId, answer);
+    return;
   }
 
-  // ── сохраняем историю ────────────────────────────────────────────────────
+  // ── режим ТЕКСТ ──────────────────────────────────────────────────────────
+  const answer = await askGemini(userId, text, env);
+
   const h = chatHistory.get(userId) || [];
-  h.push({ role: "user", text: text });
-  h.push({ role: "model", text: "ответил" });
+  h.push({ role: "user", text });
+  h.push({ role: "model", text: "ok" });
   if (h.length > MAX_HISTORY * 2) h.splice(0, h.length - MAX_HISTORY * 2);
   chatHistory.set(userId, h);
+
+  await sendMsg(env, chatId, answer);
+}
+
+// ── "печатает..." ────────────────────────────────────────────────────────────
+async function sendAction(env, chatId) {
+  try {
+    await fetch("https://api.telegram.org/bot" + env.TG_BOT_TOKEN + "/sendChatAction", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, action: "typing" }),
+    });
+  } catch (_) {}
 }
 
 // ── Gemini: текст ────────────────────────────────────────────────────────────
 async function askGemini(userId, message, env) {
   const url = "https://generativelanguage.googleapis.com/v1beta/models/" + TEXT_MODEL + ":generateContent?key=" + env.GEMINI_API_KEY;
-
   const h = chatHistory.get(userId) || [];
-  const contents = [];
-  for (const m of h.slice(-MAX_HISTORY)) {
-    contents.push({ role: m.role, parts: [{ text: m.text }] });
-  }
+  const contents = h.slice(-MAX_HISTORY).map(m => ({ role: m.role, parts: [{ text: m.text }] }));
   contents.push({ role: "user", parts: [{ text: message }] });
 
   try {
@@ -132,7 +131,7 @@ async function askGemini(userId, message, env) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents: contents,
+        contents,
         generationConfig: { temperature: 0.8, maxOutputTokens: 8192 },
       }),
     });
@@ -143,84 +142,21 @@ async function askGemini(userId, message, env) {
   }
 }
 
-// ── Gemini/Imagen: изображение ───────────────────────────────────────────────
-async function generateImage(prompt, env) {
-  // Пробуем Imagen 4.0
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + IMAGE_MODEL + ":predict?key=" + env.GEMINI_API_KEY;
-
+// ── Картинки через Pollinations.ai (бесплатно, без ключа) ────────────────────
+async function generateImage(prompt) {
   try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        instances: [{ prompt: prompt }],
-        parameters: { sampleCount: 1 },
-      }),
-    });
+    const imageUrl = "https://image.pollinations.ai/prompt/" + encodeURIComponent(prompt);
 
-    if (!resp.ok) {
-      const err = await resp.text();
+    // проверяем, что API отвечает
+    const check = await fetch(imageUrl, { method: "HEAD" });
+    if (!check.ok) throw new Error("HTTP " + check.status);
 
-      // если Imagen не сработал — пробуем Gemini Flash Image
-      if (resp.status === 404 || resp.status === 400) {
-        return generateImageGemini(prompt, env);
-      }
-
-      return { text: "😔 Ошибка: " + (resp.status === 429 ? "лимит API" : "не удалось создать картинку") };
-    }
-
-    const data = await resp.json();
-    const img = data.predictions?.[0]?.bytesBase64Encoded
-               || data.predictions?.[0]?.mimeType?.startsWith("image/") && data.predictions?.[0]?.bytesBase64Encoded;
-
-    if (img) {
-      return { image: img, caption: prompt.slice(0, 100) };
-    }
-
-    // Если Imagen не дал картинку — пробуем Gemini
-    return generateImageGemini(prompt, env);
+    return {
+      url: imageUrl,
+      caption: "🎨 " + prompt.slice(0, 100),
+    };
   } catch (e) {
-    return { text: "😔 Ошибка генерации: " + e.message + "\n\nПопробуй `/mode text`" };
-  }
-}
-
-// ── Gemini Flash Image (запасной вариант) ────────────────────────────────────
-async function generateImageGemini(prompt, env) {
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=" + env.GEMINI_API_KEY;
-
-  try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 4096,
-          responseModalities: ["Image", "Text"],
-        },
-      }),
-    });
-
-    if (!resp.ok) {
-      const errText = await resp.text();
-      if (resp.status === 429) {
-        return { text: "😔 Лимит API на генерацию картинок. Попробуй позже или переключись в `/mode text`" };
-      }
-      return { text: "😔 Не удалось сгенерировать картинку. Попробуй другой запрос или `/mode text`" };
-    }
-
-    const data = await resp.json();
-    const parts = data.candidates?.[0]?.content?.parts || [];
-
-    const imagePart = parts.find(p => p.inlineData);
-    if (imagePart) {
-      return { image: imagePart.inlineData.data, caption: parts.find(p => p.text)?.text || "" };
-    }
-
-    return { text: "😔 Не удалось создать картинку. Попробуй другой запрос или `/mode text`" };
-  } catch (e) {
-    return { text: "😔 Ошибка: " + e.message };
+    return { error: "😔 Не удалось создать картинку. Попробуй другой запрос или `/mode text`" };
   }
 }
 
@@ -231,34 +167,30 @@ async function sendMsg(env, chatId, text) {
     await fetch("https://api.telegram.org/bot" + env.TG_BOT_TOKEN + "/sendMessage", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text: text, parse_mode: "Markdown" }),
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
     });
-  } catch (e) {
-    // если Markdown упал — отправляем без форматирования
+  } catch (_) {
     try {
       await fetch("https://api.telegram.org/bot" + env.TG_BOT_TOKEN + "/sendMessage", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chat_id: chatId, text: text.replace(/[*_`\[\]]/g, "") }),
       });
-    } catch (e2) {}
+    } catch (_) {}
   }
 }
 
-// ── отправка картинки ────────────────────────────────────────────────────────
-async function sendImage(env, chatId, base64Data, caption) {
+// ── отправка картинки (через URL — Telegram сам скачает) ─────────────────────
+async function sendImage(env, chatId, imageUrl, caption) {
   try {
-    const binary = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
-    const blob = new Blob([binary], { type: "image/png" });
-    const fd = new FormData();
-    fd.append("chat_id", String(chatId));
-    fd.append("photo", blob, "image.png");
-    if (caption) {
-      fd.append("caption", caption.slice(0, 200) + "\n\n🔄 /mode — сменить режим");
-    }
     await fetch("https://api.telegram.org/bot" + env.TG_BOT_TOKEN + "/sendPhoto", {
       method: "POST",
-      body: fd,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        photo: imageUrl,
+        caption: (caption || "") + "\n\n🔄 /mode — сменить режим",
+      }),
     });
   } catch (e) {
     await sendMsg(env, chatId, "😔 Ошибка отправки картинки");
