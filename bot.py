@@ -8,7 +8,9 @@
 """
 import asyncio
 import logging
+import threading
 from collections import defaultdict
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from google import genai
 from google.genai import types as genai_types
@@ -179,6 +181,28 @@ async def error_handler(update: Update | object, context: ContextTypes.DEFAULT_T
     log.error("Exception while handling an update: %s", context.error)
 
 
+# ── health-check сервер (для Koyeb/Fly.io) ──────────────────────────────────
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Возвращает 200 OK — Koyeb проверяет, что сервер жив."""
+
+    def do_GET(self) -> None:                    # noqa: N802
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, fmt, *args) -> None:   # noqa: N802
+        log.debug("Health: " + fmt, *args)
+
+
+def _start_health_server() -> None:
+    """Запускает простой HTTP-сервер на порту 8080 в фоновом потоке."""
+    server = HTTPServer(("0.0.0.0", 8080), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info("Health-check сервер запущен на порту 8080")
+
+
 # ── точка входа ──────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -204,6 +228,9 @@ def main() -> None:
 
     # ошибки
     app.add_error_handler(error_handler)
+
+    # health-check (для облачных платформ)
+    _start_health_server()
 
     log.info(
         "🚀 Бот запущен!\n"
