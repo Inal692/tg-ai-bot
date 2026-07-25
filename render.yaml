@@ -1,6 +1,3 @@
----
-blueprintName: tg-ai-bot
-
 services:
   - type: worker
     name: tg-ai-bot
@@ -10,9 +7,9 @@ services:
     autoDeploy: false
     envVars:
       - key: TG_BOT_TOKEN
-        sync: false  # будет введён вручную в дашборде
+        value: ""
       - key: GEMINI_API_KEY
-        sync: false
+        value: ""
       - key: GEMINI_MODEL
         value: gemini-3.5-flash
       - key: MAX_HISTORY
