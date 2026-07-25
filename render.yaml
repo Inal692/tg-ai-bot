@@ -1,3 +1,6 @@
+---
+blueprintName: tg-ai-bot
+
 services:
   - type: worker
     name: tg-ai-bot
